@@ -256,7 +256,7 @@ function App() {
                     <div className="header-right">
                         <div className="backend-status">
                             <span className="online-dot"></span>
-                            localhost:8000
+                             breakmycode-api.onrender.com
                         </div>
 
                         <button
