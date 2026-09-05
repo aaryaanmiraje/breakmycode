@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import signal
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -54,7 +55,7 @@ class AnalyzeRequest(BaseModel):
 
 MAX_TESTS = 30
 COMPILE_TIMEOUT = 15
-RUN_TIMEOUT = 5.0
+RUN_TIMEOUT = 8.0
 
 
 # ============================================================
@@ -182,21 +183,21 @@ def run_program(
     input_data: str,
     timeout: float = RUN_TIMEOUT,
 ) -> dict[str, Any]:
-    """Run one test safely and return a normalized execution result.
+    """Run a compiled program with reliable stdin/stdout handling.
 
-    Uses a process group so a timeout cannot leave child processes behind.
-    Sanitizer diagnostics are preserved and can still be classified if a
-    process exits abnormally or a timeout occurs after emitting diagnostics.
+    A process group is used so a timeout kills the program and any
+    children it may have created. Sanitizer diagnostics are preserved
+    when possible instead of replacing them with a generic timeout.
     """
 
     started = time.perf_counter()
     process = None
 
     env = os.environ.copy()
-    # LeakSanitizer can add significant startup/shutdown overhead in short
-    # repeated test runs. ASan/UBSan are still enabled for memory/UB checks.
-    env.setdefault("ASAN_OPTIONS", "detect_leaks=0:abort_on_error=1")
-    env.setdefault("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
+    # LeakSanitizer can add significant shutdown work in hosted CI/container
+    # environments. ASan/UBSan remain enabled for the important diagnostics.
+    env.setdefault("ASAN_OPTIONS", "detect_leaks=0:abort_on_error=1:symbolize=0")
+    env.setdefault("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=0")
 
     try:
         process = subprocess.Popen(
@@ -205,8 +206,8 @@ def run_program(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env=env,
             start_new_session=True,
+            env=env,
         )
 
         stdout, stderr = process.communicate(
@@ -225,47 +226,45 @@ def run_program(
         }
 
     except subprocess.TimeoutExpired as exc:
-        # TimeoutExpired may contain partial stdout/stderr. Preserve it so a
-        # sanitizer diagnostic is not thrown away and mislabeled as a timeout.
-        partial_stdout = exc.stdout or ""
-        partial_stderr = exc.stderr or ""
+        # Kill the whole process group, not only the direct child.
+        if process is not None:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
 
-        if isinstance(partial_stdout, bytes):
-            partial_stdout = partial_stdout.decode("utf-8", errors="replace")
-        if isinstance(partial_stderr, bytes):
-            partial_stderr = partial_stderr.decode("utf-8", errors="replace")
+            try:
+                stdout, stderr = process.communicate(timeout=1)
+            except Exception:
+                stdout = exc.stdout or ""
+                stderr = exc.stderr or ""
+        else:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
 
-        try:
-            if process is not None:
-                os.killpg(os.getpgid(process.pid), 9)
-        except (ProcessLookupError, OSError, AttributeError):
-            pass
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
 
-        try:
-            remaining_stdout, remaining_stderr = process.communicate(timeout=1) if process else ("", "")
-        except Exception:
-            remaining_stdout, remaining_stderr = "", ""
-
-        stdout = (partial_stdout or "") + (remaining_stdout or "")
-        stderr = (partial_stderr or "") + (remaining_stderr or "")
         runtime = time.perf_counter() - started
+        diagnostic = (stderr or "").strip()
 
         return {
             "status": "timeout",
             "returncode": None,
-            "stdout": stdout.strip(),
-            "stderr": stderr.strip(),
+            "stdout": (stdout or "").strip(),
+            "stderr": diagnostic or "Execution timed out.",
             "runtime": runtime,
         }
 
     except OSError as exc:
-        runtime = time.perf_counter() - started
         return {
-            "status": "runtime_error",
+            "status": "runner_error",
             "returncode": None,
             "stdout": "",
             "stderr": str(exc),
-            "runtime": runtime,
+            "runtime": time.perf_counter() - started,
         }
 
 
@@ -276,22 +275,19 @@ def run_program(
 def classify_runtime_error(
     stderr: str,
 ) -> str | None:
-    """Classify sanitizer/runtime diagnostics by the actual error.
-
-    Do not treat the presence of AddressSanitizer itself as a memory error.
-    ASan is the diagnostic tool; the message following it determines the
-    actual category.
-    """
+    """Classify actual sanitizer diagnostics, not sanitizer presence."""
 
     text = (stderr or "").lower()
 
+    # Arithmetic/UBSan diagnostics must be checked before broad memory
+    # terms. The sanitizer name itself is NOT an error category.
     arithmetic_markers = (
         "division by zero",
         "integer divide by zero",
         "divide by zero",
         "modulo by zero",
+        "remainder by zero",
         "floating point exception",
-        "runtime error: division by zero",
     )
     if any(marker in text for marker in arithmetic_markers):
         return "arithmetic_error"
@@ -300,6 +296,7 @@ def classify_runtime_error(
         "signed integer overflow",
         "unsigned integer overflow",
         "integer overflow",
+        "signed integer overflow",
     )
     if any(marker in text for marker in overflow_markers):
         return "integer_overflow"
@@ -321,9 +318,7 @@ def classify_runtime_error(
         "alloc-dealloc-mismatch",
         "negative-size-param",
     )
-    if any(marker in text for marker in memory_markers if ".*" not in marker):
-        return "memory_error"
-    if re.search(r"index\s+[-+]?\d+\s+out of bounds", text):
+    if any(marker in text for marker in memory_markers):
         return "memory_error"
 
     return None
@@ -818,71 +813,56 @@ def test_programs(
             )
 
             # ------------------------------------------------
-            # Timeout
-            # ------------------------------------------------
-
-            if actual["status"] == "timeout":
-
-                # A sanitizer may have emitted a real diagnostic immediately
-                # before the process exceeded the wall-clock limit. Prefer the
-                # concrete diagnostic over a generic timeout in that case.
-                timeout_error = classify_runtime_error(
-                    actual.get("stderr", "")
-                )
-
-                if timeout_error:
-                    findings.append(
-                        create_finding(
-                            timeout_error,
-                            input_value,
-                            actual=actual.get("stdout", ""),
-                            expected=expected.get("stdout", ""),
-                            stderr=actual.get("stderr", ""),
-                            runtime=actual.get("runtime", 0.0),
-                        )
-                    )
-                else:
-                    findings.append(
-                        create_finding(
-                            "timeout",
-                            input_value,
-                            runtime=actual.get("runtime", 0.0),
-                        )
-                    )
-
-                continue
-
-            # ------------------------------------------------
-            # Sanitizer
+            # Runtime diagnostics first. A timeout can still leave
+            # useful sanitizer output, so never discard it.
             # ------------------------------------------------
 
             runtime_error = classify_runtime_error(
-                actual["stderr"]
+                actual.get("stderr", "")
             )
 
             if runtime_error:
-
                 findings.append(
                     create_finding(
                         runtime_error,
                         input_value,
-                        actual=actual[
-                            "stdout"
-                        ],
-                        expected=expected.get(
-                            "stdout",
-                            "",
-                        ),
-                        stderr=actual[
-                            "stderr"
-                        ],
-                        runtime=actual[
-                            "runtime"
-                        ],
+                        actual=actual.get("stdout", ""),
+                        expected=expected.get("stdout", ""),
+                        stderr=actual.get("stderr", ""),
+                        runtime=actual.get("runtime", 0.0),
                     )
                 )
-
                 continue
+
+            # ------------------------------------------------
+            # Timeout / runner failure
+            # ------------------------------------------------
+
+            if actual["status"] == "timeout":
+                findings.append(
+                    create_finding(
+                        "timeout",
+                        input_value,
+                        stderr=actual.get("stderr", ""),
+                        runtime=actual.get("runtime", 0.0),
+                    )
+                )
+                continue
+
+            if actual["status"] == "runner_error":
+                findings.append(
+                    create_finding(
+                        "crash",
+                        input_value,
+                        stderr=actual.get("stderr", ""),
+                        runtime=actual.get("runtime", 0.0),
+                    )
+                )
+                continue
+
+            # ------------------------------------------------
+            # Sanitizer already checked above.
+            # ------------------------------------------------
 
             # ------------------------------------------------
             # Crash
