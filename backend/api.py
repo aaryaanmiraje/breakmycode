@@ -232,11 +232,42 @@ def classify_runtime_error(
     text = stderr.lower()
 
     # --------------------------------------------------------
-    # Memory errors
+    # IMPORTANT: check specific arithmetic/UB diagnostics before
+    # memory markers. AddressSanitizer is a tool name, not itself
+    # proof that the failure is a memory error.
+    # --------------------------------------------------------
+
+    arithmetic_markers = (
+        "division by zero",
+        "integer divide by zero",
+        "floating point exception",
+        "modulo by zero",
+        "division by 0",
+        "divide by zero",
+    )
+
+    if any(marker in text for marker in arithmetic_markers):
+        return "arithmetic_error"
+
+    # --------------------------------------------------------
+    # Integer overflow
+    # --------------------------------------------------------
+
+    overflow_markers = (
+        "signed integer overflow",
+        "unsigned integer overflow",
+        "integer overflow",
+    )
+
+    if any(marker in text for marker in overflow_markers):
+        return "integer_overflow"
+
+    # --------------------------------------------------------
+    # Actual memory errors
+    # Do NOT use "addresssanitizer" alone.
     # --------------------------------------------------------
 
     memory_markers = (
-        "addresssanitizer",
         "stack-buffer-overflow",
         "heap-buffer-overflow",
         "global-buffer-overflow",
@@ -249,46 +280,12 @@ def classify_runtime_error(
         "container-overflow",
         "double-free",
         "invalid-free",
+        "negative-size-param",
+        "alloc-dealloc-mismatch",
     )
 
-    if any(
-        marker in text
-        for marker in memory_markers
-    ):
+    if any(marker in text for marker in memory_markers):
         return "memory_error"
-
-    # --------------------------------------------------------
-    # Integer overflow
-    # --------------------------------------------------------
-
-    overflow_markers = (
-        "signed integer overflow",
-        "unsigned integer overflow",
-        "integer overflow",
-    )
-
-    if any(
-        marker in text
-        for marker in overflow_markers
-    ):
-        return "integer_overflow"
-
-    # --------------------------------------------------------
-    # Arithmetic errors
-    # --------------------------------------------------------
-
-    arithmetic_markers = (
-        "division by zero",
-        "integer divide by zero",
-        "floating point exception",
-        "modulo by zero",
-    )
-
-    if any(
-        marker in text
-        for marker in arithmetic_markers
-    ):
-        return "arithmetic_error"
 
     return None
 
